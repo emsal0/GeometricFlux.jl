@@ -1,109 +1,116 @@
-## Top-k pooling
-import Base: +, -, *, /, broadcasted
+"""
+    accumulated_edges(adj)
 
-function topk_index(y::AbstractVector, k::Integer)
-    v = nlargest(k, y)
-    return collect(1:length(y))[y .>= v[end]]
+Return a vector which acts as a mapping table. The index is the vertex index,
+value is accumulated numbers of edge (current vertex not included).
+"""
+accumulated_edges(adj::AbstractVector{<:AbstractVector{<:Integer}}) = [0, cumsum(map(length, adj))...]
+
+Zygote.@nograd accumulated_edges
+
+Zygote.@nograd function generate_cluster(M::AbstractArray{T,N}, accu_edge) where {T,N}
+    num_V = length(accu_edge) - 1
+    num_E = accu_edge[end]
+    cluster = similar(M, Int, num_E)
+    @inbounds for i = 1:num_V
+        j = accu_edge[i]
+        k = accu_edge[i+1]
+        cluster[j+1:k] .= i
+    end
+    cluster
 end
-
-topk_index(y::Adjoint, k::Integer) = topk_index(y', k)
-
-
-
-## Get feature with defaults
-
-get_feature(::Nothing, i) = nothing
-get_feature(A::Fill{T,2,Axes}, i::Integer) where {T,Axes} = view(A, :, 1)
-get_feature(A::AbstractMatrix, i::Integer) = view(A, :, i)
 
 """
-    bypass_graph(nf_func, ef_func, gf_func)
+    vertex_pair_table(adj[, num_E])
 
-Bypassing graph in FeaturedGraph and let other layer process (node, edge and global)features only.
+Generate a mapping from edge index to vertex pair (i, j). The edge indecies are determined by
+the sorted vertex indecies.
 """
-function bypass_graph(nf_func=identity, ef_func=identity, gf_func=identity)
-    return function (fg::FeaturedGraph)
-        FeaturedGraph(graph(fg),
-                      nf=nf_func(node_feature(fg)),
-                      ef=ef_func(edge_feature(fg)),
-                      gf=gf_func(global_feature(fg)))
+function vertex_pair_table(adj::AbstractVector{<:AbstractVector{<:Integer}},
+                           num_E=sum(map(length, adj)))
+    table = similar(adj[1], Tuple{UInt32,UInt32}, num_E)
+    e = one(UInt64)
+    for (i, js) = enumerate(adj)
+        js = sort(js)
+        for j = js
+            table[e] = (i, j)
+            e += one(UInt64)
+        end
     end
+    table
 end
 
-function add_self_loop!(adj::AbstractVector{T}, n::Int=length(adj)) where {T<:AbstractVector}
-    for i = 1:n
-        i in adj[i] || push!(adj[i], i)
+function vertex_pair_table(eidx::Dict)
+    table = Array{Tuple{UInt32,UInt32}}(undef, num_E)
+    for (k, v) = eidx
+        table[v] = k
     end
-    adj
+    table
 end
 
-# Used for untrainable parameters, like epsilon in GINConv when set to false.
-# NOTE: Only works for scalars untrainable params.
-mutable struct Untrainable{T <: Number}
-    value::T
+Zygote.@nograd vertex_pair_table
+
+"""
+    edge_index_table(adj[, directed])
+
+Generate a mapping from vertex pair (i, j) to edge index. The edge indecies are determined by
+the sorted vertex indecies.
+"""
+function edge_index_table(adj::AbstractVector{<:AbstractVector{<:Integer}}, directed::Bool=is_directed(adj))
+    table = Dict{Tuple{UInt32,UInt32},UInt64}()
+    e = one(UInt64)
+    if directed
+        for (i, js) = enumerate(adj)
+            js = sort(js)
+            for j = js
+                table[(i, j)] = e
+                e += one(UInt64)
+            end
+        end
+    else
+        for (i, js) = enumerate(adj)
+            js = sort(js)
+            js = js[i .≤ js]
+            for j = js
+                table[(i, j)] = e
+                table[(j, i)] = e
+                e += one(UInt64)
+            end
+        end
+    end
+    table
 end
 
-+(u::Untrainable, z::Number) = u.value+z
-@adjoint +(u::Untrainable, z::Number) = u+z, _->(nothing, 1.0)
-+(z::Number,u::Untrainable) = u.value+z
-@adjoint +(z::Number, u::Untrainable) = z+u, _->(1.0, nothing)
-+(u1::Untrainable,u2::Untrainable) = u1.value + u2.value
-@adjoint +(u1::Untrainable, u2::Untrainable) = u1+u2, _->(nothing,nothing)
+function edge_index_table(vpair::AbstractVector{<:Tuple})
+    table = Dict{Tuple{UInt32,UInt32},UInt64}()
+    for (i, p) = enumerate(vpair)
+        table[p] = i
+    end
+    table
+end
 
--(u::Untrainable, z::Number) = u.value-z
-@adjoint -(u::Untrainable, z::Number) = u-z, _->(nothing, -1.0)
--(z::Number,u::Untrainable) = z-u.value
-@adjoint -(z::Number, u::Untrainable) = z-u, _->(1.0, nothing)
--(u1::Untrainable,u2::Untrainable) = u1.value - u2.value
-@adjoint -(u1::Untrainable, u2::Untrainable) = u1-u2, _->(nothing,nothing)
+edge_index_table(fg::FeaturedGraph) = edge_index_table(fg.graph, fg.directed)
 
-*(u::Untrainable, z::Number) = u.value*z
-@adjoint *(u::Untrainable, z::Number) = u*z, _->(nothing, u.value)
-*(z::Number,u::Untrainable) = z*u.value
-@adjoint *(z::Number, u::Untrainable) = z*u, _->(u.value, nothing)
-*(u1::Untrainable,u2::Untrainable) = u1.value - u2.value
-@adjoint *(u1::Untrainable, u2::Untrainable) = u1*u2, _->(nothing,nothing)
+Zygote.@nograd edge_index_table
 
-/(u::Untrainable, z::Number) = u.value/z
-@adjoint /(u::Untrainable, z::Number) = u/z, _->(nothing, -u.value/(z^2))
-/(z::Number,u::Untrainable) = z/u.value
-@adjoint /(z::Number, u::Untrainable) = z/u, _->(1/u.value, nothing)
-/(u1::Untrainable,u2::Untrainable) = u1.value - u2.value
-@adjoint /(u1::Untrainable, u2::Untrainable) = u1/u2, _->(nothing,nothing)
+function transform(X::AbstractArray, vpair::AbstractVector{<:Tuple}, num_V)
+    dims = size(X)[1:end-1]..., num_V, num_V
+    Y = similar(X, dims)
+    for (i, p) in enumerate(vpair)
+        view(Y, :, p[1], p[2]) .= view(X, :, i)
+    end
+    Y
+end
 
-broadcasted(::typeof(+), a::Untrainable, b::AbstractArray) = 
-    broadcasted(+, a.value, b)
-@adjoint broadcasted(::typeof(+), a::Untrainable, b::AbstractArray) = 
-    broadcasted(+, a, b), _->(nothing, nothing, ones(size(b)))
+function transform(X::AbstractArray, eidx::Dict)
+    dims = size(X)[1:end-2]..., length(eidx)
+    Y = similar(X, dims)
+    for (k, v) in eidx
+        view(Y, :, v) .= view(X, :, k[1], k[2])
+    end
+    Y
+end
 
-broadcasted(::typeof(+), a::AbstractArray, b::Untrainable) = 
-    broadcasted(+, a, b.value)
-@adjoint broadcasted(::typeof(+), a::AbstractArray, b::Untrainable) = 
-    broadcasted(+, a, b), _->(nothing, ones(size(b)), nothing)
-
-broadcasted(::typeof(-), a::Untrainable, b::AbstractArray) = 
-    broadcasted(-, a.value, b)
-@adjoint broadcasted(::typeof(-), a::Untrainable, b::AbstractArray) = 
-    broadcasted(-, a, b), _->(nothing, nothing, -ones(size(b)))
-
-broadcasted(::typeof(-), a::AbstractArray, b::Untrainable) = 
-    broadcasted(-, a, b.value)
-@adjoint broadcasted(::typeof(-), a::AbstractArray, b::Untrainable) = 
-    broadcasted(-, a, b), _->(nothing, ones(size(a)), nothing)
-
-*(a::Untrainable, b::AbstractArray) = a.value * b
-@adjoint *(a::Untrainable, b::AbstractArray) = 
-    a * b, _->(nothing, nothing, a.value * ones(size(b)))
-*(a::AbstractArray, b::Untrainable) = a * b.value
-@adjoint broadcasted(::typeof(*), a::AbstractArray, b::Untrainable) = 
-    a * b, _->(nothing, b.value * ones(size(a)), nothing)
-
-broadcasted(::typeof(/), a::Untrainable, b::AbstractArray) = 
-    broadcasted(/, a.value, b)
-@adjoint broadcasted(::typeof(/), a::Untrainable, b::AbstractArray) = 
-    broadcasted(/, a, b), _->(nothing, nothing, a.value ./ (b.^2))
-    
-/(a::AbstractArray, b::Untrainable) = /(a, b.value)
-@adjoint /(a::AbstractArray, b::Untrainable) = 
-    a/b, _->(nothing, (1/b.value) * ones(size(a)), nothing)
-
+### TODO move these to GraphSignals ######
+# @functor FeaturedGraph
+# Zygote.@nograd normalized_laplacian, scaled_laplacian
